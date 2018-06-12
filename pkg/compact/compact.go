@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"io/ioutil"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/improbable-eng/thanos/pkg/block"
@@ -440,23 +442,23 @@ func (cg *Group) Resolution() int64 {
 
 // Compact plans and runs a single compaction against the group. The compacted result
 // is uploaded into the bucket the blocks were retrieved from.
-func (cg *Group) Compact(ctx context.Context, dir string, comp tsdb.Compactor) (ulid.ULID, error) {
+func (cg *Group) Compact(ctx context.Context, dir string, comp tsdb.Compactor) (bool, error) {
 	subDir := path.Join(dir, cg.Key())
 
 	if err := os.RemoveAll(subDir); err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "clean compaction group dir")
+		return false, errors.Wrap(err, "clean compaction group dir")
 	}
 	if err := os.MkdirAll(subDir, 0777); err != nil {
-		return ulid.ULID{}, errors.Wrap(err, "create compaction group dir")
+		return false, errors.Wrap(err, "create compaction group dir")
 	}
 
-	id, err := cg.compact(ctx, subDir, comp)
+	continueCompact, err := cg.compact(ctx, subDir, comp)
 	if err != nil {
 		cg.compactionFailures.Inc()
 	}
 	cg.compactions.Inc()
 
-	return id, err
+	return continueCompact, err
 }
 
 // HaltError is a type wrapper for errors that should halt any further progress on compactions.
@@ -532,13 +534,13 @@ func (cg *Group) areBlocksOverlapping(include *block.Meta, excludeDirs ...string
 	return nil
 }
 
-func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (compID ulid.ULID, err error) {
+func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (nothingToCompact bool, err error) {
 	cg.mtx.Lock()
 	defer cg.mtx.Unlock()
 
 	// Check for overlapped blocks.
 	if err := cg.areBlocksOverlapping(nil); err != nil {
-		return compID, halt(errors.Wrap(err, "pre compaction overlap check"))
+		return false, halt(errors.Wrap(err, "pre compaction overlap check"))
 	}
 
 	// Planning a compaction works purely based on the meta.json files in our future group's dir.
@@ -546,21 +548,21 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 	for _, meta := range cg.blocks {
 		bdir := filepath.Join(dir, meta.ULID.String())
 		if err := os.MkdirAll(bdir, 0777); err != nil {
-			return compID, errors.Wrap(err, "create planning block dir")
+			return false, errors.Wrap(err, "create planning block dir")
 		}
 		if err := block.WriteMetaFile(bdir, meta); err != nil {
-			return compID, errors.Wrap(err, "write planning meta file")
+			return false, errors.Wrap(err, "write planning meta file")
 		}
 	}
 
 	// Plan against the written meta.json files.
 	plan, err := comp.Plan(dir)
 	if err != nil {
-		return compID, errors.Wrap(err, "plan compaction")
+		return false, errors.Wrap(err, "plan compaction")
 	}
 	if len(plan) == 0 {
 		// Nothing to do.
-		return compID, nil
+		return true, nil
 	}
 
 	// Due to #183 we verify that none of the blocks in the plan have overlapping sources.
@@ -573,32 +575,70 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 	for _, pdir := range plan {
 		meta, err := block.ReadMetaFile(pdir)
 		if err != nil {
-			return compID, errors.Wrapf(err, "read meta from %s", pdir)
+			return false, errors.Wrapf(err, "read meta from %s", pdir)
 		}
 
 		if cg.Key() != GroupKey(*meta) {
-			return compID, halt(errors.Wrapf(err, "compact planned compaction for mixed groups. group: %s, planned block's group: %s", cg.Key(), GroupKey(*meta)))
+			return false, halt(errors.Wrapf(err, "compact planned compaction for mixed groups. group: %s, planned block's group: %s", cg.Key(), GroupKey(*meta)))
 		}
 
 		for _, s := range meta.Compaction.Sources {
 			if _, ok := uniqueSources[s]; ok {
-				return compID, halt(errors.Errorf("overlapping sources detected for plan %v", plan))
+				return false, halt(errors.Errorf("overlapping sources detected for plan %v", plan))
 			}
 			uniqueSources[s] = struct{}{}
 		}
 
 		id, err := ulid.Parse(filepath.Base(pdir))
 		if err != nil {
-			return compID, errors.Wrapf(err, "plan dir %s", pdir)
+			return false, errors.Wrapf(err, "plan dir %s", pdir)
 		}
 
 		if err := block.Download(ctx, cg.bkt, id, pdir); err != nil {
-			return compID, retry(errors.Wrapf(err, "download block %s", id))
+			return false, retry(errors.Wrapf(err, "download block %s", id))
 		}
 
 		// Ensure all input blocks are valid.
-		if err := block.VerifyIndex(filepath.Join(pdir, block.IndexFilename), meta.MinTime, meta.MaxTime); err != nil {
-			return compID, halt(errors.Wrapf(err, "invalid plan block %s", pdir))
+		stats, err := block.GatherIndexIssueStats(filepath.Join(pdir, block.IndexFilename), meta.MinTime, meta.MaxTime)
+		if err != nil {
+			return false, errors.Wrapf(err, "gather index issues for block %s", pdir)
+		}
+
+		if err = stats.CriticalErr(); err == nil {
+			return false, halt(errors.Wrapf(err, "invalid plan block %s", pdir))
+		}
+
+		if err = stats.Issue347OutsideChunksErr(); err != nil {
+			level.Info(cg.logger).Log("msg", "stopping compaction and repairing invalid plan block", "err", err.Error(), "broken_block_id", pdir)
+
+			tmpdir, err := ioutil.TempDir("", fmt.Sprintf("index-issue-347-block-%s-", id))
+			if err != nil {
+				return false, err
+			}
+			defer os.RemoveAll(tmpdir)
+
+			// We need to repair this block before doing compaction.
+			resid, err := block.Repair(tmpdir, id, block.IgnoreIssue347OutsideChunk)
+			if err != nil {
+				return false, errors.Wrapf(err, "repair failed for block %s", id)
+			}
+
+			// Verify repaired block before uploading it.
+			if err := block.VerifyIndex(filepath.Join(tmpdir, resid.String(), block.IndexFilename), meta.MinTime, meta.MaxTime); err != nil {
+				return false, errors.Wrapf(err, "repaired block is invalid %s", resid)
+			}
+
+			level.Info(cg.logger).Log("msg", "uploading repaired block", "newID", resid)
+			if err = block.Upload(ctx, cg.bkt, filepath.Join(tmpdir, resid.String())); err != nil {
+				return false, retry(errors.Wrapf(err, "upload of %s failed", resid))
+			}
+
+			level.Info(cg.logger).Log("msg", "deleting broken block", "id", pdir)
+			if err := block.Delete(ctx, cg.bkt, id); err != nil {
+				return false, errors.Wrapf(err, "deleting old block %s failed. You need to delete this block manually", id)
+			}
+
+			return false, nil
 		}
 	}
 	level.Debug(cg.logger).Log("msg", "downloaded and verified blocks",
@@ -606,9 +646,9 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 
 	begin = time.Now()
 
-	compID, err = comp.Compact(dir, plan...)
+	compID, err := comp.Compact(dir, plan...)
 	if err != nil {
-		return compID, halt(errors.Wrapf(err, "compact blocks %v", plan))
+		return false, halt(errors.Wrapf(err, "compact blocks %v", plan))
 	}
 	level.Debug(cg.logger).Log("msg", "compacted blocks",
 		"blocks", fmt.Sprintf("%v", plan), "duration", time.Since(begin))
@@ -617,23 +657,23 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 
 	newMeta, err := block.Finalize(bdir, cg.labels.Map(), cg.resolution, nil)
 	if err != nil {
-		return compID, errors.Wrapf(err, "failed to finalize the block %s", bdir)
+		return false, errors.Wrapf(err, "failed to finalize the block %s", bdir)
 	}
 
 	// Ensure the output block is valid.
 	if err := block.VerifyIndex(filepath.Join(bdir, block.IndexFilename), newMeta.MinTime, newMeta.MaxTime); err != nil {
-		return compID, halt(errors.Wrapf(err, "invalid result block %s", bdir))
+		return false, halt(errors.Wrapf(err, "invalid result block %s", bdir))
 	}
 
 	// Ensure the output block is not overlapping with anything else.
 	if err := cg.areBlocksOverlapping(newMeta, plan...); err != nil {
-		return compID, halt(errors.Wrapf(err, "resulted compacted block %s overlaps with something", bdir))
+		return false, halt(errors.Wrapf(err, "resulted compacted block %s overlaps with something", bdir))
 	}
 
 	begin = time.Now()
 
 	if err := block.Upload(ctx, cg.bkt, bdir); err != nil {
-		return compID, retry(errors.Wrapf(err, "upload of %s failed", compID))
+		return false, retry(errors.Wrapf(err, "upload of %s failed", compID))
 	}
 	level.Debug(cg.logger).Log("msg", "uploaded block", "result_block", compID, "duration", time.Since(begin))
 
@@ -643,11 +683,11 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 	for _, b := range plan {
 		id, err := ulid.Parse(filepath.Base(b))
 		if err != nil {
-			return compID, errors.Wrapf(err, "plan dir %s", b)
+			return false, errors.Wrapf(err, "plan dir %s", b)
 		}
 
 		if err := os.RemoveAll(b); err != nil {
-			return compID, errors.Wrapf(err, "remove old block dir %s", id)
+			return false, errors.Wrapf(err, "remove old block dir %s", id)
 		}
 
 		// Spawn a new context so we always delete a block in full on shutdown.
@@ -656,10 +696,10 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 		err = block.Delete(delCtx, cg.bkt, id)
 		cancel()
 		if err != nil {
-			return compID, retry(errors.Wrapf(err, "delete old block %s from bucket ", id))
+			return false, retry(errors.Wrapf(err, "delete old block %s from bucket ", id))
 		}
 		cg.groupGarbageCollectedBlocks.Inc()
 	}
 
-	return compID, nil
+	return false, nil
 }

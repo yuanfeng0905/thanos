@@ -13,7 +13,6 @@ import (
 	"github.com/improbable-eng/thanos/pkg/objstore/s3"
 	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/oklog/run"
-	"github.com/oklog/ulid"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -141,13 +140,12 @@ func runCompact(
 				}
 				done := true
 				for _, g := range groups {
-					id, err := g.Compact(ctx, compactDir, comp)
+					nothingToCompact, err := g.Compact(ctx, compactDir, comp)
 					if err != nil {
 						return errors.Wrap(err, "compaction")
 					}
-					// If the returned ID has a zero value, the group had no blocks to be compacted.
 					// We keep going through the outer loop until no group has any work left.
-					if id != (ulid.ULID{}) {
+					if !nothingToCompact {
 						done = false
 					}
 				}
